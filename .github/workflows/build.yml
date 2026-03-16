@@ -124,7 +124,7 @@ jobs:
 
       # ==================== 检出仓库代码 ====================
       - name: 检出代码仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ==================== 初始化构建环境 ====================
       # 设置各种路径变量，包括内核源码、补丁、工具等目录
@@ -401,37 +401,25 @@ jobs:
           echo "obj-y += hmbird_patch.o" >> Makefile
 
       # ==================== 确定 KernelSU 分支 ====================
-      # 根据用户选择的变体和分支，确定实际使用的 Git 分支
+      # 根据用户输入的分支名/commit hash，或使用默认值
       - name: 确定 KernelSU 分支
         id: ksu-branch
         run: |
           branch_input="${{ inputs.ksu_branch }}"
           variant_input="${{ inputs.ksu_variant }}"
 
-          if [ "$variant_input" = "ReSukiSU" ]; then
-            BRANCH="-s main"
+          # 如果用户输入了自定义分支名或 commit hash，直接使用
+          if [ -n "$branch_input" ]; then
+            BRANCH="-s $branch_input"
+            echo "使用自定义分支/提交: $branch_input"
           else
-            case "$branch_input" in
-              "Stable(标准)")
-                case "$variant_input" in
-                  "Next") ;; # Next 使用硬编码分支，不需要 BRANCH
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  "Official"|"MKSU") BRANCH="-s main" ;;
-                  *) BRANCH="-" ;;
-                esac
-                ;;
-              "Dev(开发)")
-                case "$variant_input" in
-                  "Official"|"MKSU") BRANCH="-s main" ;;
-                  "Next") ;; # Next 使用硬编码分支，不需要 BRANCH
-                  "SukiSU") BRANCH="-s builtin" ;;
-                  *) echo "未知变体: $variant_input" >&2; exit 1 ;;
-                esac
-                ;;
-              *)
-                echo "未知分支: $branch_input" >&2
-                exit 1
-                ;;
+            # 留空则使用默认值
+            case "$variant_input" in
+              "ReSukiSU") BRANCH="-s main" ;;
+              "Next") BRANCH="" ;; # Next 使用硬编码分支，不需要 BRANCH
+              "SukiSU") BRANCH="-s builtin" ;;
+              "Official"|"MKSU") BRANCH="-s main" ;;
+              *) BRANCH="-" ;;
             esac
 
             # SukiSU 不启用 SUSFS 时强制使用 main 分支
@@ -440,15 +428,17 @@ jobs:
             fi
           fi
 
-          # 检查是否启用自定义提交 (仅对 SukiSU 生效)
-          CONFIG_FILE="config/config"
-          if [ -f "$CONFIG_FILE" ]; then
-            CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
-            if [ "$CUSTOM_ENABLED" == "true" ] && [ "$variant_input" == "SukiSU" ]; then
-              SUKISU_COMMIT=$(grep "^sukisu=" "$CONFIG_FILE" | cut -d'=' -f2)
-              if [ -n "$SUKISU_COMMIT" ]; then
-                BRANCH="-s $SUKISU_COMMIT"
-                echo "SukiSU 使用自定义提交: $SUKISU_COMMIT"
+          # 检查是否启用自定义提交 (仅对 SukiSU 生效，且未手动指定分支时)
+          if [ -z "$branch_input" ]; then
+            CONFIG_FILE="config/config"
+            if [ -f "$CONFIG_FILE" ]; then
+              CUSTOM_ENABLED=$(grep "^custom=" "$CONFIG_FILE" | cut -d'=' -f2)
+              if [ "$CUSTOM_ENABLED" == "true" ] && [ "$variant_input" == "SukiSU" ]; then
+                SUKISU_COMMIT=$(grep "^sukisu=" "$CONFIG_FILE" | cut -d'=' -f2)
+                if [ -n "$SUKISU_COMMIT" ]; then
+                  BRANCH="-s $SUKISU_COMMIT"
+                  echo "SukiSU 使用配置文件中的自定义提交: $SUKISU_COMMIT"
+                fi
               fi
             fi
           fi
@@ -713,6 +703,17 @@ jobs:
                 patch -p1 < task_mmu.c.patch || true
               fi
             fi
+
+            # Android 16 - 6.12 修复
+            if [[ "${{ inputs.android_version }}" == "android16" && "${{ inputs.kernel_version }}" == "6.12" ]]; then
+              # 修复 setuid_hook.c 重复定义: 当 CONFIG_KSU_SUSFS 启用时，
+              # 底部 #if (>=6.8 && MANUAL_HOOK) 块会产生第二个 ksu_handle_setresuid 定义
+              SETUID_HOOK="$KERNEL_ROOT/common/drivers/kernelsu/setuid_hook.c"
+              if [ -f "$SETUID_HOOK" ]; then
+                sed -i 's/defined(CONFIG_KSU_MANUAL_HOOK))/!defined(CONFIG_KSU_SUSFS) \&\& defined(CONFIG_KSU_MANUAL_HOOK))/' "$SETUID_HOOK"
+                echo "已修复 setuid_hook.c 重复定义问题"
+              fi
+            fi
           fi
 
       # ==================== Unicode 绕过修复 ====================
@@ -929,11 +930,29 @@ jobs:
           # 配置内核名称
           if [ -n "${{ inputs.version }}" ]; then
             CLEAN_VERSION=$(echo "${{ inputs.version }}" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')
-            # 6.6+：新格式 setlocalversion，保留 ${KERNELVERSION}
-            perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"${CLEAN_VERSION}"'"/s' ./common/scripts/setlocalversion 2>/dev/null || true
-            # 旧格式（5.x/6.1）回退
-            sed -i "\$s|echo \"\$res\"|echo \"${CLEAN_VERSION}\"|" ./common/scripts/setlocalversion 2>/dev/null || true
-            sed -i '/^CONFIG_LOCALVERSION=/ s/="\([^"]*\)"/="'"$CLEAN_VERSION"'"/' ./common/arch/arm64/configs/gki_defconfig
+            
+            # 定义 KMI_TAG（与自动版本保持一致）
+            case "${{ inputs.android_version }}-${{ inputs.kernel_version }}" in
+              "android14-6.1")  KMI_TAG="android14-11" ;;
+              "android15-6.6")  KMI_TAG="android15-8" ;;
+              "android16-6.12") KMI_TAG="android16-5" ;;
+              *) KMI_TAG="${{ inputs.android_version }}" ;;
+            esac
+            
+            if [ "${{ inputs.kernel_version }}" = "6.1" ]; then
+              # 6.1：旧格式，包含 KMI_TAG
+              KMI_LOCAL="-${KMI_TAG}${CLEAN_VERSION}"
+              sed -i "\$s|echo \"\$res\"|echo \"${KMI_LOCAL}\"|" ./common/scripts/setlocalversion 2>/dev/null || true
+              sed -i "/^CONFIG_LOCALVERSION=/ s/=\"[^\"]*\"/=\"${KMI_LOCAL}\"/" ./common/arch/arm64/configs/gki_defconfig 2>/dev/null || true
+            elif [ "${{ inputs.kernel_version }}" = "5.10" ] || [ "${{ inputs.kernel_version }}" = "5.15" ]; then
+              # 5.x：旧格式，不包含 KMI_TAG
+              sed -i "\$s|echo \"\$res\"|echo \"${CLEAN_VERSION}\"|" ./common/scripts/setlocalversion 2>/dev/null || true
+              sed -i '/^CONFIG_LOCALVERSION=/ s/="\([^"]*\)"/="'"$CLEAN_VERSION"'"/' ./common/arch/arm64/configs/gki_defconfig
+            else
+              # 6.6+：新格式 setlocalversion，包含 KMI_TAG
+              SUFFIX="-${KMI_TAG}${CLEAN_VERSION}"
+              perl -i -0777 -pe 's/(.*)echo "\$\{KERNELVERSION\}\$\{file_localversion\}\$\{config_localversion\}\$\{LOCALVERSION\}\$\{scm_version\}"/$1echo "\$\{KERNELVERSION\}'"${SUFFIX}"'"/s' ./common/scripts/setlocalversion 2>/dev/null || true
+            fi
           elif [ ! -f "build/build.sh" ]; then
             cd ./common
             BID="ab$((RANDOM % 90000000 + 10000000))"
@@ -1134,7 +1153,7 @@ jobs:
       # ==================== 构建 Boot 镜像 (Android 13+) ====================
       # Android 13 及以上版本不需要 ramdisk
       - name: 构建 Boot 镜像 (Android 13+)
-        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15'
+        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
         working-directory: bootimgs
         run: |
           gzip -n -k -f -9 ./Image > ./Image.gz
